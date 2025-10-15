@@ -1,19 +1,23 @@
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback,
+)
 import evaluate
-import torch
 import numpy as np
+import torch
+import optuna
 
 # ----------------------------
 # Configuration
 # ----------------------------
-MODEL = "roberta-large"  # Pretrained MNLI model
+MODEL = "FacebookAI/roberta-base"
 DATA_DIR = "data"
-MAX_LENGTH = 256  # shorten input for faster training
-BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 4
+MAX_LENGTH = 256
 NUM_EPOCHS = 8
-LR = 3e-5
 
 # ----------------------------
 # Load dataset
@@ -24,12 +28,9 @@ data_files = {
     "test": f"{DATA_DIR}/test.jsonl"
 }
 ds = load_dataset("json", data_files=data_files)
-print("Columns:", ds["train"].column_names)
-
-# Encode label column
 ds = ds.class_encode_column("label")
 num_labels = ds["train"].features["label"].num_classes
-print(f"Number of labels: {num_labels}")
+print(f"✅ Number of labels: {num_labels}")
 
 # ----------------------------
 # Tokenizer & preprocessing
@@ -37,31 +38,11 @@ print(f"Number of labels: {num_labels}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
 
 def preprocess(batch):
-    texts = [t.strip().lower() for t in batch["txt"]]  # basic normalization
-    return tokenizer(
-        texts, 
-        padding="max_length", 
-        truncation=True, 
-        max_length=MAX_LENGTH
-    )
+    texts = [t.strip().lower() for t in batch["txt"]]
+    return tokenizer(texts, padding="longest", truncation=True, max_length=MAX_LENGTH)
 
 ds = ds.map(preprocess, batched=True)
-
-# Only keep columns needed for model
 ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
-
-# ----------------------------
-# Load model (ignore mismatched classifier head)
-# ----------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Using device:", device)
-
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL,
-    num_labels=num_labels,
-    ignore_mismatched_sizes=True  # fix 3->2 label mismatch
-)
-model.to(device)
 
 # ----------------------------
 # Metrics
@@ -76,40 +57,65 @@ def compute_metrics(eval_preds):
 # ----------------------------
 # Training arguments
 # ----------------------------
+best_hyperparams = {
+    "learning_rate": 1.316e-05,
+    "per_device_train_batch_size": 16,
+    "weight_decay": 0.01395,
+    "warmup_ratio": 0.05169
+}
+
 training_args = TrainingArguments(
     output_dir="./results",
     save_strategy="epoch",
     save_total_limit=1,
-    num_train_epochs=NUM_EPOCHS,
-    learning_rate=LR,
-    per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+    num_train_epochs=3,  # or increase to 6–8 for better training
+    learning_rate=best_hyperparams["learning_rate"],
+    per_device_train_batch_size=best_hyperparams["per_device_train_batch_size"],
+    per_device_eval_batch_size=best_hyperparams["per_device_train_batch_size"],
+    gradient_accumulation_steps=4,
+    warmup_ratio=best_hyperparams["warmup_ratio"],
+    weight_decay=best_hyperparams["weight_decay"],
     eval_strategy="epoch",
-    warmup_ratio=0.1,
-    weight_decay=0.01,
     fp16=True,
     logging_dir="./logs",
     load_best_model_at_end=True,
     metric_for_best_model="f1",
     lr_scheduler_type="linear",
-    report_to="none"  # disable wandb/tensorboard reporting if not needed
+    report_to="none"
 )
+
+# ----------------------------
+# model_init FUNCTION (required for Optuna)
+# ----------------------------
+def model_init():
+    return AutoModelForSequenceClassification.from_pretrained(
+        MODEL,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True
+    )
 
 # ----------------------------
 # Trainer
 # ----------------------------
 trainer = Trainer(
-    model=model,
+    model_init=model_init,  # ✅ instead of passing model directly
     args=training_args,
     train_dataset=ds["train"],
     eval_dataset=ds["validation"],
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
 )
 
+
+
 # ----------------------------
-# Train & evaluate
+# Re-train with best params
 # ----------------------------
+
 trainer.train()
 results = trainer.evaluate(ds["test"])
-print("Test results:", results)
+
+print("\n✅ Final Test Results:")
+print(results)
+
+trainer.save_model("best_model")
